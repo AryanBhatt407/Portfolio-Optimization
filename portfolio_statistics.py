@@ -191,6 +191,77 @@ def transaction_cost_summary(weight_history, slippage_rate=0.001):
     }
 
 
+def cagr_from_cumulative(cum_series):
+    """
+    Computes the Compound Annual Growth Rate from a series of cumulative
+    portfolio values (where the first value represents 1.0 = start of period).
+    Returns a decimal (0.12 == 12 %/year). Falls back to 0.0 on degenerate input.
+    """
+    if cum_series is None or len(cum_series) < 2:
+        return 0.0
+    s = pd.Series(cum_series).dropna()
+    if s.empty:
+        return 0.0
+    start_val = float(s.iloc[0]) if float(s.iloc[0]) > 0 else 1.0
+    end_val = float(s.iloc[-1])
+    if start_val <= 0 or end_val <= 0:
+        return 0.0
+    try:
+        years = max(1e-6, (s.index[-1] - s.index[0]).days / 365.25)
+    except Exception:
+        years = max(1e-6, len(s) / TRADING_DAYS)
+    return (end_val / start_val) ** (1.0 / years) - 1.0
+
+
+def cagr_from_daily_returns(daily_returns):
+    """
+    CAGR computed directly from a daily-return series.
+    """
+    if daily_returns is None or len(daily_returns) < 2:
+        return 0.0
+    cum = (1.0 + pd.Series(daily_returns).fillna(0.0)).cumprod()
+    return cagr_from_cumulative(cum)
+
+
+def calendar_year_returns(daily_returns):
+    """
+    Returns a pandas Series of calendar-year returns (e.g. 2018: 0.034, 2019: 0.211, ...)
+    computed by compounding the daily return series within each calendar year.
+    Output is a decimal (0.12 == 12 %).
+    """
+    if daily_returns is None:
+        return pd.Series(dtype=float)
+    s = pd.Series(daily_returns).dropna()
+    if s.empty:
+        return pd.Series(dtype=float)
+    grouped = (1.0 + s).groupby(s.index.year).prod() - 1.0
+    grouped.index.name = "Year"
+    return grouped
+
+
+def per_year_breakdown(cum_series_dict):
+    """
+    Given a dict of {strategy_name: cumulative-value pandas-Series}, returns a
+    DataFrame with each calendar year as a row and one column per strategy
+    showing that year's return (as a decimal).
+    """
+    if not cum_series_dict:
+        return pd.DataFrame()
+
+    yearly = {}
+    for name, cum in cum_series_dict.items():
+        s = pd.Series(cum).dropna()
+        if s.empty:
+            continue
+        # Convert cumulative-value series back to daily returns, then compound by year
+        daily = s.pct_change().fillna(0.0)
+        yearly[name] = calendar_year_returns(daily)
+
+    if not yearly:
+        return pd.DataFrame()
+    return pd.DataFrame(yearly).sort_index()
+
+
 def full_risk_report(portfolio_returns, market_returns, risk_free_rate, cumulative_returns):
     """
     Generates a comprehensive risk report for a portfolio.

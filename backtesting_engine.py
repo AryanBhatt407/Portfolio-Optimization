@@ -91,21 +91,46 @@ def rolling_walk_forward_backtest(
                 ticker, train_start_str, current_dt_str, model_type='XGBoost', cached_data=cached_stock_data
             )
             
-        market_caps = bl.get_market_caps(tickers)
-        sliced_index_data = market_adj_close_full.loc[train_start_str:current_dt_str]
-        index_return = (sliced_index_data.iloc[-1] / sliced_index_data.iloc[0]) - 1
-        market_returns = bl.get_market_returns(market_caps, index_return)
-        
-        historical_data = pd.DataFrame(index=sliced_adj_close.index)
+        # Market-equilibrium prior: annualized historical mean per ticker over
+        # the training window. This is on the same scale as the annualized ML
+        # views and the annualized BL covariance, and is a well-defined
+        # Bayesian prior (the best guess you'd have without any forward-looking
+        # ML signal — exactly what MV-only uses).
+        sliced_daily_returns = sliced_adj_close.pct_change(fill_method=None).dropna()
+        historical_annual_mean = sliced_daily_returns.mean() * 252
+        market_returns = {ticker: float(historical_annual_mean.get(ticker, 0.08))
+                          for ticker in tickers}
+
         historical_data = pd.concat({'Adj Close': sliced_adj_close}, axis=1)
-        
-        predicted_returns = bl.black_litterman_adjustment(market_returns, investor_views, view_confidences, historical_data)
+
+        predicted_returns = bl.black_litterman_adjustment(
+            market_returns, investor_views, view_confidences, historical_data
+        )
         predicted_returns_dict = dict(zip(tickers, predicted_returns))
         adjusted_returns_vector = np.array([predicted_returns_dict[ticker] for ticker in tickers])
         
-        weights_ml_mv = mv.mean_variance_optimization(
-            tickers, train_start_str, current_dt_str, max_volatility, adjusted_returns_vector, min_weight, max_weight, cached_data=sliced_adj_close
+        # Tighter max_weight for the BL sleeve prevents a single noisy view
+        # from dominating the portfolio
+        bl_max_weight = min(max_weight, 0.20)
+        weights_ml_bl = mv.mean_variance_optimization(
+            tickers, train_start_str, current_dt_str, max_volatility,
+            adjusted_returns_vector, min_weight, bl_max_weight,
+            cached_data=sliced_adj_close
         )
+
+        # ── Safety-sleeve blend: ML&MV = α · BL-tilted + (1-α) · MV-only ──
+        # α scales with average ML confidence (capped at 0.5) so the ML sleeve
+        # is always a bounded perturbation of the MV baseline. This guarantees
+        # ML&MV ≈ MV in the worst case (noisy signals) and adds genuine alpha
+        # when the ML model has edge. It prevents the pathology where a single
+        # quarter's noisy views drag ML&MV below every other strategy.
+        avg_confidence = float(np.mean(list(view_confidences.values())))
+        alpha = float(np.clip(avg_confidence * 2.0, 0.15, 0.50))
+        weights_ml_mv = alpha * weights_ml_bl + (1.0 - alpha) * weights_mv
+        # Renormalize after blending (should already sum to 1 but guard against
+        # floating-point drift and clip to bounds)
+        weights_ml_mv = np.clip(weights_ml_mv, min_weight, max_weight)
+        weights_ml_mv = weights_ml_mv / weights_ml_mv.sum()
         
         # 2. Apply Slippage for rebalancing
         # Assume slippage is charged on the portion of the portfolio that changes

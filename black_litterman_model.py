@@ -1,31 +1,59 @@
 import numpy as np
 
 
-def black_litterman_adjustment(market_returns, investor_views, view_confidences, historical_data, tau=0.025):
+TRADING_DAYS = 252
+
+
+def black_litterman_adjustment(market_returns, investor_views, view_confidences, historical_data, tau=0.05):
     """
-    Adjust market returns based on the investor's views and confidences using historical data
-    :param dict market_returns: expected market returns for each asset
-    :param dict investor_views: investor's specific views on the expected returns of assets
-    :param dict view_confidences: investor's confidence in each view
-    :param pandas Dataframe historical_data: historical market data
-    :param float tau: The uncertainty of the market equilibrium
-    :return: numpy array, the adjusted returns for each asset after considering the investor's views
+    Blend a market-equilibrium prior with the ML-derived investor views using
+    the Black-Litterman formula. All inputs are on an ANNUALIZED return scale
+    (decimals, e.g. 0.12 == 12 % / yr) so the posterior is also annualized.
+
+    Critical fixes vs. the earlier version:
+    - The covariance matrix is **annualized** (× 252) to match the scale of
+      the annualized views. Previously it was daily (~1e-4), which made
+      (τΣ)⁻¹ enormous and caused the prior to swamp the views regardless
+      of how confident they were.
+    - Omega is scaled by each view's variance on an annualized basis so the
+      confidence floor (0.05 R²) maps to a reasonable uncertainty.
+
+    :param dict market_returns: annualized equilibrium expected returns per ticker
+    :param dict investor_views: annualized ML views per ticker (same keys as market_returns)
+    :param dict view_confidences: ML confidence per ticker in [0.05, 1.0]
+    :param pandas.DataFrame historical_data: multiindex DataFrame with top-level 'Adj Close'
+    :param float tau: uncertainty-of-the-prior scalar (0.025-0.10 typical)
+    :return: numpy array of posterior annualized expected returns, aligned to market_returns order
     """
-    num_assets = len(market_returns)
-    P = np.eye(num_assets)  # Proportion matrix
-    Q = np.array(list(investor_views.values())).reshape(-1, 1)
+    tickers_ordered = list(market_returns.keys())
+    num_assets = len(tickers_ordered)
+    P = np.eye(num_assets)
 
-    cov_matrix = historical_data['Adj Close'].pct_change().dropna().cov()
+    pi = np.array([market_returns[t] for t in tickers_ordered]).reshape(-1, 1)
+    Q = np.array([investor_views[t] for t in tickers_ordered]).reshape(-1, 1)
+    conf_vec = np.array([max(view_confidences[t], 0.05) for t in tickers_ordered])
 
-    
-    omega = np.diag([tau / confidence for confidence in view_confidences.values()])
+    # Annualized covariance matrix — same scale as views and prior
+    daily_cov = historical_data['Adj Close'].pct_change().dropna().cov()
+    # Keep ordering aligned with tickers_ordered
+    daily_cov = daily_cov.reindex(index=tickers_ordered, columns=tickers_ordered)
+    cov_annual = daily_cov.values * TRADING_DAYS
 
-   
-    inv_omega = np.linalg.inv(omega)
-    adjusted_returns = np.linalg.inv(np.linalg.inv(tau * cov_matrix) + np.dot(P.T, np.dot(inv_omega, P)))
-    adjusted_returns = np.dot(adjusted_returns, np.dot(np.linalg.inv(tau * cov_matrix), np.array(list(market_returns.values())).reshape(-1, 1)) + np.dot(P.T, np.dot(inv_omega, Q)))
+    # Omega: diagonal uncertainty of views. Higher confidence → smaller omega.
+    # Scale each view's uncertainty by the asset's annualized variance so
+    # tau and omega live in comparable units.
+    asset_variances = np.diag(cov_annual)
+    omega_diag = np.maximum(tau * asset_variances / conf_vec, 1e-8)
+    omega = np.diag(omega_diag)
 
-    return adjusted_returns.flatten()
+    tau_sigma = tau * cov_annual
+    tau_sigma_inv = np.linalg.pinv(tau_sigma)
+    omega_inv = np.linalg.pinv(omega)
+
+    posterior_cov = np.linalg.pinv(tau_sigma_inv + P.T @ omega_inv @ P)
+    posterior_mean = posterior_cov @ (tau_sigma_inv @ pi + P.T @ omega_inv @ Q)
+
+    return posterior_mean.flatten()
 
 
 def get_market_caps(tickers):
